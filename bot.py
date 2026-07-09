@@ -33,6 +33,9 @@ PLATIGA_LK_URL = "https://platega.io/"
 BLIZKO_API_URL = os.getenv("BLIZKO_API_URL", "https://vector-chat-api.onrender.com")
 BLIZKO_API_KEY = os.getenv("BLIZKO_API_KEY", "")
 
+# Схема Postgres для resume-bot (изолирована от таблиц Blizko в том же Supabase-проекте)
+DB_SCHEMA = os.getenv("DB_SCHEMA", "resume_bot")
+
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 groq_client = Groq(api_key=GROQ_API_KEY)
@@ -156,7 +159,13 @@ SYSTEM_PROMPT = {
 }
 
 def get_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+    conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+    # Изолируем resume-bot в собственной схеме внутри общего Supabase-проекта Blizko,
+    # чтобы таблицы users/settings/etc. не пересекались с таблицами Blizko.
+    with conn.cursor() as c:
+        c.execute(f"SET search_path TO {DB_SCHEMA}, public")
+    conn.commit()
+    return conn
 
 def get_conn_with_retry(retries=5, delay=3):
     for attempt in range(1, retries + 1):
@@ -174,6 +183,15 @@ def get_conn_with_retry(retries=5, delay=3):
 def init_database():
     conn = get_conn_with_retry(retries=5, delay=3)
     c = conn.cursor()
+
+    # Схема создаётся на случай, если её ещё нет (безопасно при повторных запусках)
+    try:
+        c.execute(f"CREATE SCHEMA IF NOT EXISTS {DB_SCHEMA}")
+        conn.commit()
+        logger.info(f"Схема {DB_SCHEMA} проверена/создана")
+    except Exception as e:
+        logger.error(f"Ошибка создания схемы {DB_SCHEMA}: {e}")
+        conn.rollback()
 
     tables = {
         "users": """
