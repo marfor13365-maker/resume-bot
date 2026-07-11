@@ -29,7 +29,7 @@ API_SECRET = os.getenv("API_SECRET")
 PLATIGA_API_URL = "https://app.platega.io/transaction/process"
 PLATIGA_LK_URL = "https://platega.io/"
 
-# Blizko: интеграция с vector-chat-api (разблокировка/доп.аккаунт)
+# Blizko: интеграция с vector-chat-api (доп.аккаунты)
 BLIZKO_API_URL = os.getenv("BLIZKO_API_URL", "https://vector-chat-api.onrender.com")
 BLIZKO_API_KEY = os.getenv("BLIZKO_API_KEY", "")
 
@@ -48,6 +48,18 @@ SUPPORT_EMAIL = "marfor13365@gmail.com"
 user_states = {}
 user_data = {}
 user_menu_msg = {}
+
+# Достаём id заявки из вставленной пользователем ссылки (или сырого id)
+REQUEST_ID_RE = re.compile(r"e_([a-zA-Z0-9\-]+)")
+
+def extract_request_id(pasted_text):
+    m = REQUEST_ID_RE.search(pasted_text.strip())
+    if m:
+        return m.group(1)
+    cleaned = pasted_text.strip()
+    if re.fullmatch(r"[a-zA-Z0-9\-]{8,}", cleaned):
+        return cleaned
+    return None
 
 # ========== ПЕРЕВОДЫ ==========
 T = {
@@ -99,7 +111,12 @@ T = {
         "btn_vpn_instruction": "📖 Инструкция",
         "vpn_paid_success": "✅ Оплата VPN получена!\n\n{instruction}",
         "vpn_no_keys": "⚠️ К сожалению, все ключи временно закончились. Обратитесь к администратору.",
-        "blizko_terms": "📜 *Правила оплаты на сайте Blizko (Знакомства)*\n\nСайт приложения: https://marfor13365-maker.github.io/Znakomstva/\n\nОплата через этого бота даёт доступ к одной услуге: разблокировке аккаунта или регистрации дополнительного аккаунта на устройстве. Оплата не подлежит возврату после выдачи кода доступа. Код одноразовый и действителен только для устройства, с которого была создана заявка.",
+        "btn_blizko_extra": "💳 Оплатить доп. аккаунт в Blizko",
+        "btn_rules": "📜 Правила",
+        "blizko_ask_link": "Вставь сюда ссылку, которую тебе показал сайт Blizko:",
+        "blizko_link_invalid": "Не распознал ссылку. Проверь, что скопировал её полностью с сайта Blizko, и вставь ещё раз.",
+        "blizko_request_gone": "⚠️ Заявка не найдена или уже обработана. Получи новую ссылку на сайте Blizko.",
+        "blizko_terms": "📜 *Правила*\n\nАдаптация резюме под вакансию — сервис этого бота. Приложение Blizko (сайт: https://marfor13365-maker.github.io/Znakomstva/) — отдельный сервис, оплата дополнительного аккаунта на устройстве проходит здесь. Оплата не подлежит возврату после выдачи кода доступа. Код одноразовый и действителен только для устройства, с которого была создана заявка.",
     },
     "en": {
         "choose_lang": "🌍 Выберите язык / Choose language:",
@@ -149,7 +166,12 @@ T = {
         "btn_vpn_instruction": "📖 Instructions",
         "vpn_paid_success": "✅ VPN payment received!\n\n{instruction}",
         "vpn_no_keys": "⚠️ Sorry, all keys are temporarily sold out. Contact administrator.",
-        "blizko_terms": "📜 *Blizko (Dating App) payment terms*\n\nApp website: https://marfor13365-maker.github.io/Znakomstva/\n\nPayment through this bot grants access to one service: unlocking an account or registering an additional account on this device. Payment is non-refundable after the access code is issued. The code is single-use and only valid for the device the request was created from.",
+        "btn_blizko_extra": "💳 Pay for extra Blizko account",
+        "btn_rules": "📜 Rules",
+        "blizko_ask_link": "Paste the link the Blizko site showed you:",
+        "blizko_link_invalid": "Couldn't recognize that link. Make sure you copied it fully from Blizko, then paste it again.",
+        "blizko_request_gone": "⚠️ Request not found or already processed. Get a new link from the Blizko site.",
+        "blizko_terms": "📜 *Rules*\n\nResume adaptation is this bot's own service. The Blizko app (site: https://marfor13365-maker.github.io/Znakomstva/) is a separate service; payment for an extra account on a device happens here. Payment is non-refundable after the access code is issued. The code is single-use and only valid for the device the request was created from.",
     }
 }
 
@@ -160,8 +182,6 @@ SYSTEM_PROMPT = {
 
 def get_conn():
     conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
-    # Изолируем resume-bot в собственной схеме внутри общего Supabase-проекта Blizko,
-    # чтобы таблицы users/settings/etc. не пересекались с таблицами Blizko.
     with conn.cursor() as c:
         c.execute(f"SET search_path TO {DB_SCHEMA}, public")
     conn.commit()
@@ -184,7 +204,6 @@ def init_database():
     conn = get_conn_with_retry(retries=5, delay=3)
     c = conn.cursor()
 
-    # Схема создаётся на случай, если её ещё нет (безопасно при повторных запусках)
     try:
         c.execute(f"CREATE SCHEMA IF NOT EXISTS {DB_SCHEMA}")
         conn.commit()
@@ -275,7 +294,6 @@ def init_database():
         ("INSERT INTO settings(key,value) VALUES('vpn_price','300') ON CONFLICT(key) DO NOTHING", None),
         ("INSERT INTO settings(key,value) VALUES('vpn_description','🔐 Анонимный и быстрый VPN без ограничений трафика и скорости. Подходит для любых устройств.') ON CONFLICT(key) DO NOTHING", None),
         ("INSERT INTO settings(key,value) VALUES('vpn_instruction','📱 Инструкция по подключению VPN через Happ:\n\n1️⃣ Скачайте приложение:\n• Android (Google Play): https://play.google.com/store/apps/details?id=com.happproxy\n• Android (RuStore): https://apps.rustore.ru/app/com.happproxy\n• iOS: https://apps.apple.com/ru/app/happ-proxy-utility/id6504287215\n\n2️⃣ Скопируйте ключ: {key}\n\n3️⃣ Откройте Happ → кнопка «+» → «Из буфера» → нажмите на сервер.\n\n✅ Готово!') ON CONFLICT(key) DO NOTHING", None),
-        ("INSERT INTO settings(key,value) VALUES('blizko_unlock_price','199') ON CONFLICT(key) DO NOTHING", None),
         ("INSERT INTO settings(key,value) VALUES('blizko_extra_base_price','200') ON CONFLICT(key) DO NOTHING", None),
     ]
     for sql, params in init_data:
@@ -683,14 +701,11 @@ def blizko_mark_paid(request_id):
         logger.error(f"blizko_mark_paid exception: {e}")
         return None
 
-def get_blizko_unlock_price():
-    return int(get_setting("blizko_unlock_price") or 199)
-
 def get_blizko_extra_base_price():
     return int(get_setting("blizko_extra_base_price") or 200)
 
 def blizko_get_request_info(request_id):
-    """Спрашивает у Render точную цену и тип заявки (там уже посчитана прогрессия)."""
+    """Спрашивает у Render точную цену заявки (там уже посчитана прогрессия)."""
     try:
         r = requests.get(f"{BLIZKO_API_URL}/api/unlock/status/{request_id}", timeout=10)
         if r.status_code == 200:
@@ -699,38 +714,30 @@ def blizko_get_request_info(request_id):
         logger.error(f"blizko_get_request_info exception: {e}")
     return None
 
-def blizko_offer_kb(req_type):
+def blizko_offer_kb():
     kb = telebot.types.InlineKeyboardMarkup(row_width=1)
-    kb.add(telebot.types.InlineKeyboardButton("💳 Оплатить", callback_data=f"blizko_pay_{req_type}"))
+    kb.add(telebot.types.InlineKeyboardButton("💳 Оплатить", callback_data="blizko_pay"))
     return kb
 
-def show_blizko_offer(cid, req_type, request_id):
+def show_blizko_offer(cid, request_id):
     info = blizko_get_request_info(request_id)
     if not info:
-        bot.send_message(cid, "⚠️ Не удалось загрузить заявку. Попробуй получить новую ссылку на сайте.")
+        bot.send_message(cid, t(cid, "blizko_request_gone"))
         return
 
     price = info["price"]
     user_data.setdefault(cid, {})["blizko_request_id"] = request_id
-    user_data[cid]["blizko_req_type"] = req_type
     user_data[cid]["blizko_price"] = price
 
-    if req_type == "unlock":
-        text = (
-            "🔓 *Разблокировка аккаунта Blizko*\n\n"
-            f"Стоимость: {price}₽\n\n"
-            "После оплаты ты получишь код — введи его на сайте, чтобы вернуть доступ к аккаунту."
-        )
-    else:
-        text = (
-            "➕ *Дополнительный аккаунт Blizko*\n\n"
-            f"Стоимость: {price}₽\n\n"
-            "После оплаты ты получишь код — введи его на сайте, чтобы создать второй аккаунт на этом устройстве."
-        )
+    text = (
+        "➕ *Дополнительный аккаунт Blizko*\n\n"
+        f"Стоимость: {price}₽\n\n"
+        "После оплаты пришлю код — скопируй его и вставь на сайте Blizko, чтобы создать второй аккаунт на этом устройстве."
+    )
 
     delete_prev_menu(cid)
     text = text + "\n\n" + t(cid, "blizko_terms")
-    msg = bot.send_message(cid, text, reply_markup=blizko_offer_kb(req_type), parse_mode="Markdown")
+    msg = bot.send_message(cid, text, reply_markup=blizko_offer_kb(), parse_mode="Markdown")
     user_menu_msg[cid] = msg.message_id
 
 def t(uid, key, **kwargs):
@@ -788,7 +795,9 @@ def main_kb(uid):
         kb.add(telebot.types.InlineKeyboardButton(t(uid, "btn_optimize"), callback_data="start_flow"))
     kb.add(telebot.types.InlineKeyboardButton(t(uid, "btn_vpn"), callback_data="vpn_menu"))
     kb.add(telebot.types.InlineKeyboardButton(t(uid, "btn_my_sub"), callback_data="my_sub"))
+    kb.add(telebot.types.InlineKeyboardButton(t(uid, "btn_blizko_extra"), callback_data="blizko_extra_start"))
     kb.add(telebot.types.InlineKeyboardButton(t(uid, "btn_info"), callback_data="info"))
+    kb.add(telebot.types.InlineKeyboardButton(t(uid, "btn_rules"), callback_data="rules"))
     kb.add(telebot.types.InlineKeyboardButton(t(uid, "btn_support"), callback_data="support"))
     return kb
 
@@ -842,7 +851,6 @@ def admin_kb():
     kb.add(telebot.types.InlineKeyboardButton(f"💰 Цена резюме: {price_text}", callback_data="admin_price"))
     kb.add(telebot.types.InlineKeyboardButton(f"📅 Дней подписки: {days}", callback_data="admin_days"))
     kb.add(telebot.types.InlineKeyboardButton(f"🔐 Цена VPN: {vpn_price}₽/мес", callback_data="admin_vpn_price"))
-    kb.add(telebot.types.InlineKeyboardButton(f"🔓 Цена разблокировки Blizko: {get_blizko_unlock_price()}₽", callback_data="admin_blizko_unlock_price"))
     kb.add(telebot.types.InlineKeyboardButton(f"➕ Базовая цена доп.аккаунта Blizko: {get_blizko_extra_base_price()}₽", callback_data="admin_blizko_extra_price"))
     kb.add(telebot.types.InlineKeyboardButton(f"📝 Описание VPN", callback_data="admin_vpn_desc"))
     kb.add(telebot.types.InlineKeyboardButton(f"📖 Инструкция VPN", callback_data="admin_vpn_instruction"))
@@ -876,13 +884,12 @@ def start(message):
     parts = message.text.split(maxsplit=1)
     param = parts[1].strip() if len(parts) > 1 else ""
 
-    if param.startswith("u_") or param.startswith("e_"):
-        req_type = "unlock" if param.startswith("u_") else "extra_account"
+    if param.startswith("e_"):
         request_id = param[2:]
         user_states[cid] = None
         upsert_user(cid)
         delete_prev_menu(cid)
-        show_blizko_offer(cid, req_type, request_id)
+        show_blizko_offer(cid, request_id)
         return
 
     user_states[cid] = None
@@ -915,6 +922,7 @@ def _show_admin(cid):
         f"🔐 VPN цена: {vpn_price}₽/мес\n"
         f"🔑 VPN ключи: {vpn_free} свободно / {vpn_used} использовано\n"
         f"📡 Активных VPN: {vpn_active_subs}\n"
+        f"➕ Базовая цена доп.аккаунта Blizko: {get_blizko_extra_base_price()}₽\n"
         f"📢 Реклама: {'✅ Вкл' if ad_active else '❌ Выкл'}\n"
         f"📝 Текст рекламы: {ad_text}\n\n"
         f"🎫 Обращений: {count_tickets()}\n"
@@ -985,27 +993,36 @@ def cb(call):
             user_data[cid] = {"service_type": "subscription", "amount": int(get_setting("price")), "description": f"Подписка на {get_setting('subscription_days')} дней"}
         except:
             pass
-    elif data.startswith("blizko_pay_"):
-        req_type = data.replace("blizko_pay_", "")
+    elif data == "rules":
+        kb = telebot.types.InlineKeyboardMarkup()
+        kb.add(telebot.types.InlineKeyboardButton(t(cid, "btn_back"), callback_data="back_main"))
+        try:
+            bot.edit_message_text(t(cid, "blizko_terms"), cid, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
+        except:
+            send_menu(cid, t(cid, "blizko_terms"), kb)
+    elif data == "blizko_extra_start":
+        user_states[cid] = "awaiting_blizko_link"
+        try:
+            bot.edit_message_text(t(cid, "blizko_ask_link"), cid, call.message.message_id, reply_markup=back_main_kb(cid))
+            user_menu_msg[cid] = call.message.message_id
+        except:
+            send_menu(cid, t(cid, "blizko_ask_link"), back_main_kb(cid))
+    elif data == "blizko_pay":
         if not MERCHANT_ID or not API_SECRET:
             bot.answer_callback_query(call.id, "Платёжная система временно недоступна.")
             return
         request_id = user_data.get(cid, {}).get("blizko_request_id")
-        if not request_id:
-            bot.answer_callback_query(call.id, "Заявка не найдена, начните заново по ссылке с сайта.")
+        price = user_data.get(cid, {}).get("blizko_price")
+        if not request_id or not price:
+            bot.answer_callback_query(call.id, "Заявка не найдена, вставь ссылку заново.")
             return
-        price = user_data[cid].get("blizko_price")
-        if not price:
-            bot.answer_callback_query(call.id, "Заявка не найдена, начните заново по ссылке с сайта.")
-            return
-        description = "Blizko: разблокировка аккаунта" if req_type == "unlock" else "Blizko: дополнительный аккаунт"
         try:
             bot.edit_message_text("Выберите способ оплаты:", cid, call.message.message_id, reply_markup=payment_methods_kb(cid))
             user_states[cid] = "choosing_payment_method"
             user_data[cid].update({
-                "service_type": f"blizko_{req_type}",
+                "service_type": "blizko_extra_account",
                 "amount": price,
-                "description": description,
+                "description": "Blizko: дополнительный аккаунт",
                 "blizko_request_id": request_id
             })
         except:
@@ -1118,12 +1135,6 @@ def cb(call):
         user_states[cid] = "admin_set_days"
         try:
             bot.edit_message_text(f"📅 Текущее кол-во дней: {get_setting('subscription_days')}\n\nВведите новое количество:", cid, call.message.message_id, reply_markup=back_main_kb(cid))
-        except:
-            pass
-    elif data == "admin_blizko_unlock_price" and cid == ADMIN_ID:
-        user_states[cid] = "admin_set_blizko_unlock_price"
-        try:
-            bot.edit_message_text(f"🔓 Текущая цена разблокировки: {get_blizko_unlock_price()}₽\n\nВведите новую цену (число):", cid, call.message.message_id, reply_markup=back_main_kb(cid))
         except:
             pass
     elif data == "admin_blizko_extra_price" and cid == ADMIN_ID:
@@ -1307,6 +1318,15 @@ def text_handler(message):
     if text.startswith("/"):
         return
 
+    if state == "awaiting_blizko_link":
+        request_id = extract_request_id(text)
+        if not request_id:
+            bot.send_message(cid, t(cid, "blizko_link_invalid"))
+            return
+        user_states[cid] = None
+        show_blizko_offer(cid, request_id)
+        return
+
     if state == "writing_support":
         save_ticket(cid, text)
         user_states[cid] = None
@@ -1345,15 +1365,6 @@ def text_handler(message):
     if state == "admin_set_days" and cid == ADMIN_ID:
         try:
             set_setting("subscription_days", int(text))
-            user_states[cid] = None
-            _show_admin(cid)
-        except:
-            bot.send_message(cid, "❌ Введите число.")
-        return
-
-    if state == "admin_set_blizko_unlock_price" and cid == ADMIN_ID:
-        try:
-            set_setting("blizko_unlock_price", int(text))
             user_states[cid] = None
             _show_admin(cid)
         except:
@@ -1543,15 +1554,14 @@ def platiga_webhook():
                 else:
                     bot.send_message(user_id, t(user_id, "vpn_no_keys"), reply_markup=main_kb(user_id))
                     bot.send_message(ADMIN_ID, f"⚠️ У пользователя {user_id} прошла оплата VPN, но нет свободных ключей!")
-            elif service_type in ("blizko_unlock", "blizko_extra_account"):
+            elif service_type == "blizko_extra_account":
                 request_id = payload.get("request_id")
                 if request_id:
                     code = blizko_mark_paid(request_id)
                     if code:
-                        kind_text = "Разблокировка аккаунта" if service_type == "blizko_unlock" else "Дополнительный аккаунт"
                         bot.send_message(
                             user_id,
-                            f"✅ Оплата получена!\n\n🔐 {kind_text}\n\nТвой код доступа:\n`{code}`\n\nВведи его на сайте Blizko, чтобы продолжить.",
+                            f"✅ Оплата получена!\n\n➕ Дополнительный аккаунт\n\nТвой код доступа:\n`{code}`\n\nВставь его на сайте Blizko, чтобы продолжить.",
                             parse_mode="Markdown",
                             reply_markup=main_kb(user_id)
                         )
@@ -1572,7 +1582,6 @@ def cron_post():
 @app.route("/api/blizko-prices", methods=["GET"])
 def blizko_prices():
     return {
-        "unlock_price": get_blizko_unlock_price(),
         "extra_base_price": get_blizko_extra_base_price()
     }, 200
 
